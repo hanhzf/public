@@ -1,0 +1,181 @@
+#cloud-config
+
+# 在启动时输出hello信息
+bootcmd:
+  - 'echo "$(date): Hello, cloud-init! ${instance_name} Redis脚本开始执行..." | tee ${log_file}'
+
+# 更新包管理器
+package_update: ${package_update}
+package_upgrade: ${package_upgrade}
+
+# 安装必要的包
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+
+# 创建安装脚本
+write_files:
+  - path: /tmp/install-docker.sh
+    content: |
+      #!/bin/bash
+      set -e
+      
+      # 设置日志文件
+      LOG_FILE="${log_file}"
+      
+      # 函数：记录带时间戳的日志
+      log() {
+        echo "$(date '+%Y-%m-%d %H:%M:%S'): $1" | tee -a "$LOG_FILE"
+      }
+      
+      # 开始记录
+      log "========================================="
+      log "开始执行Docker和Redis安装脚本"
+      log "实例: ${instance_name}"
+      log "========================================="
+      
+      # 设置非交互模式
+      export DEBIAN_FRONTEND=noninteractive
+      
+      # 等待包管理器解锁的函数
+      wait_for_apt_lock() {
+        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || sudo fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+          log "等待apt锁释放..."
+          sleep 5
+        done
+      }
+      
+      log "等待apt锁释放..."
+      wait_for_apt_lock
+      
+      log "开始安装Docker..."
+      
+      # 添加Docker官方GPG密钥
+      log "添加Docker官方GPG密钥..."
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+      
+      # 添加Docker软件源
+      log "添加Docker软件源..."
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      
+      # 更新软件包索引
+      log "更新软件包索引..."
+      wait_for_apt_lock
+      apt-get update
+      
+      # 安装Docker Engine
+      log "安装Docker Engine..."
+      wait_for_apt_lock
+      apt-get install -y docker-ce docker-ce-cli containerd.io
+      
+      # 启动并启用Docker服务
+      log "启动并启用Docker服务..."
+      systemctl start docker
+      systemctl enable docker
+      
+      # 将用户添加到docker组
+      log "将用户添加到docker组..."
+      usermod -aG docker ubuntu || usermod -aG docker root || true
+      
+      log "Docker安装完成！"
+      
+      # 安装Docker Compose
+      log "开始安装Docker Compose..."
+      curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+      chmod +x /usr/local/bin/docker-compose
+      
+      log "Docker Compose安装完成！"
+      
+      %{ if harbor_enabled ~}
+      # 登录到Harbor仓库（如果启用）
+      log "登录到Harbor仓库..."
+      echo "${harbor_password}" | docker login ${harbor_registry} -u ${harbor_username} --password-stdin
+      
+      if [ $? -eq 0 ]; then
+        log "Harbor仓库登录成功！"
+      else
+        log "Harbor仓库登录失败，将使用默认Redis镜像"
+      fi
+      %{ endif ~}
+      
+      # 创建Redis数据目录
+      log "创建Redis数据目录..."
+      mkdir -p ${redis_data_dir}
+      chmod 755 ${redis_data_dir}
+      
+      # 创建Redis配置文件
+      log "创建Redis配置文件..."
+      mkdir -p ${redis_data_dir}/conf
+      cat > ${redis_data_dir}/conf/redis.conf << 'EOF'
+# Redis配置文件
+bind 0.0.0.0
+port 6379
+requirepass ${redis_password}
+maxmemory ${redis_max_memory}
+maxmemory-policy ${redis_max_memory_policy}
+appendonly yes
+appendfsync everysec
+save 900 1
+save 300 10
+save 60 10000
+EOF
+      
+      # 运行Redis容器
+      log "启动Redis容器..."
+      docker run -d \
+        --name ${redis_container_name} \
+        --restart=unless-stopped \
+        -p ${redis_port}:6379 \
+        -v ${redis_data_dir}/data:/data \
+        -v ${redis_data_dir}/conf/redis.conf:/usr/local/etc/redis/redis.conf \
+        redis:${redis_version} \
+        redis-server /usr/local/etc/redis/redis.conf
+      
+      # 等待Redis容器启动
+      log "等待Redis容器启动（${startup_wait_time}秒）..."
+      sleep ${startup_wait_time}
+      
+      # 验证安装
+      log "========================================="
+      log "验证安装结果"
+      log "========================================="
+      
+      docker --version | tee -a "$LOG_FILE"
+      docker-compose --version | tee -a "$LOG_FILE"
+      
+      log "当前运行的容器："
+      docker ps | tee -a "$LOG_FILE"
+      
+      log "Redis容器日志（最后10行）："
+      docker logs --tail 10 ${redis_container_name} 2>&1 | tee -a "$LOG_FILE" || log "获取Redis日志失败"
+      
+      # 测试Redis连接
+      log "测试Redis连接..."
+      docker exec ${redis_container_name} redis-cli -a ${redis_password} ping | tee -a "$LOG_FILE" || log "Redis连接测试失败"
+      
+      log "========================================="
+      log "Redis连接信息："
+      log "主机: localhost"
+      log "端口: ${redis_port}"
+      log "密码: ${redis_password}"
+      log "内存限制: ${redis_max_memory}"
+      log "淘汰策略: ${redis_max_memory_policy}"
+      log "数据持久化: 已启用 (AOF + RDB)"
+      log "========================================="
+      log "cloud-init 脚本执行完成！Redis安装成功！"
+      log "========================================="
+    permissions: '0755'
+
+# 在系统启动后运行安装脚本
+runcmd:
+  - 'echo "$(date): 开始执行runcmd阶段..." | tee -a /var/log/cloudinit-execution.log'
+  - 'chmod +x /tmp/install-docker.sh'
+  - 'echo "$(date): 开始执行Docker和Redis安装脚本..." | tee -a /var/log/cloudinit-execution.log'
+  - '/tmp/install-docker.sh'
+  - 'echo "$(date): Docker和Redis安装脚本执行完毕!" | tee -a /var/log/cloudinit-execution.log'
+
+# 最终消息
+final_message: "cloud-init 配置完成！${instance_name} 的Docker和Redis安装已完成。"
